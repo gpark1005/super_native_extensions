@@ -287,47 +287,73 @@ class ClipboardHistoryItem {
   /// Attempts to reconstruct DataReaderItems from PersistableDataItems.
   /// This is a simplified reconstruction, mainly for display.
   Future<List<DataReaderItem>> _reconstructReaderItemsFromPersistables() async {
-    List<DataReaderItem> reconstructed = [];
+    List<DataReaderItem> reconstructedItems = [];
     for (final pItem in persistableItems) {
-      final writerItem = DataWriterItem(); // Use a DataWriter to build up data
-      bool added = false;
+      final writer = DataWriterItem();
+      bool hasData = false;
+
       if (pItem.plainText != null) {
-        writerItem.add(Formats.plainText(pItem.plainText!));
-        added = true;
+        writer.add(Formats.plainText(pItem.plainText!));
+        hasData = true;
       }
       if (pItem.htmlText != null) {
-        writerItem.add(Formats.htmlText(pItem.htmlText!));
-        added = true;
+        writer.add(Formats.htmlText(pItem.htmlText!));
+        hasData = true;
       }
       if (pItem.pngBase64 != null) {
         try {
           final bytes = base64Decode(pItem.pngBase64!);
-          writerItem.add(Formats.png(bytes));
-          added = true;
+          writer.add(Formats.png(bytes));
+          hasData = true;
         } catch (e) {
           print("Error decoding base64 PNG for item $id: $e");
         }
       }
       if (pItem.uri != null) {
         try {
-          writerItem.add(Formats.uri(NamedUri(Uri.parse(pItem.uri!)))); // Assuming no name for persisted URI
-          added = true;
+          writer.add(Formats.uri(NamedUri(Uri.parse(pItem.uri!))));
+          hasData = true;
         } catch (e) {
           print("Error parsing URI for item $id: $e");
         }
       }
 
-      if (added) {
-        // To get a DataReaderItem, we need a DataProvider.
-        // We can create a ClipboardDataProvider from the DataWriterItem.
-        final dataProvider = ClipboardDataProvider(writerItem.toDataProviderHandle());
-        // Then create a DataReader from this provider.
-        // This is a bit of a workaround to get a live DataReader.
-        final tempReader = await SystemClipboard.instance!.readFromProvider(dataProvider);
-        reconstructed.addAll(tempReader.items);
+      if (hasData) {
+        // This is the crucial part: create a DataReader from the DataWriterItem's content.
+        // The DataReader.fromItems constructor takes List<DataReaderItemValue>.
+        // We need to transform the writer's content into DataReaderItemValue.
+        // This might be tricky as DataWriterItem holds formats and lazy thunks,
+        // while DataReaderItemValue expects readily available data or specific provider types.
+
+        // Simpler approach for reconstruction:
+        // Since DataReader.forDataProvider is the way to go:
+        final provider = ClipboardDataProvider(writer.toDataProviderHandle());
+
+        // Define the formats we expect to read back. This should align with what was written.
+        // This is a simplified list. For a generic solution, one might need to inspect writer.formats
+        // but that's not directly exposed.
+        List<DataFormat> availableFormats = [];
+        if (pItem.plainText != null) availableFormats.add(Formats.plainText);
+        if (pItem.htmlText != null) availableFormats.add(Formats.htmlText);
+        if (pItem.pngBase64 != null) availableFormats.add(Formats.png);
+        if (pItem.uri != null) availableFormats.add(Formats.uri);
+
+        if (availableFormats.isNotEmpty) {
+          final reader = DataReader.forDataProvider(provider, formats: availableFormats);
+          // A DataReader can have multiple items if the provider itself represents multiple items.
+          // Here, each DataWriterItem becomes a source for potentially one DataReaderItem in the new DataReader.
+          // However, DataReader.forDataProvider itself returns a single DataReader,
+          // which then has one or more items (DataReaderItem) in its .items list.
+          // We assume here each PersistableDataItem corresponds to one DataReaderItem conceptually.
+          // So we take the first (and likely only) item from the reader.
+          final List<DataReaderItem> itemsFromReader = await reader.items;
+          if (itemsFromReader.isNotEmpty) {
+             reconstructedItems.addAll(itemsFromReader); // Add all items if the reader yields multiple
+          }
+        }
       }
     }
-    return reconstructed;
+    return reconstructedItems;
   }
 
 
