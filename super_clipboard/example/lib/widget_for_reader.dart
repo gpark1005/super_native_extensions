@@ -13,21 +13,82 @@ const formatCustom = CustomValueFormat<Uint8List>(
   applicationId: "com.superlist.clipboard.Example.CustomType",
 );
 
-void buildWidgetsForReaders(
+/// Asynchronously builds a list of [Widget]s to display the content of clipboard items.
+///
+/// This function iterates through a collection of [ReaderInfo] objects (each representing
+/// a single logical item from the clipboard, which might itself contain multiple data formats).
+/// For each `ReaderInfo`, it generates a list of `_RepresentationWidget`s, one for each
+/// available and renderable data format (e.g., plain text, HTML, PNG).
+///
+/// - [context]: The `BuildContext` used for creating widgets (e.g., for `MediaQuery`, `Theme`).
+/// - [readers]: An iterable of [ReaderInfo] objects, each associated with a `DataReader`
+///   from `super_clipboard`.
+///
+/// Returns a `Future` that completes with a flat list of all generated representation widgets.
+Future<List<Widget>> buildWidgetsForReaders(
   BuildContext context,
   Iterable<ReaderInfo> readers,
-  ValueChanged<List<Widget>> onWidgets,
-) {
-  final widgets = Future.wait(
-    readers.mapIndexed(
-      (index, element) => _buildWidgetForReader(context, element, index),
-    ),
-  );
-  // Instead of await invoke callback when widgets are built.
-  widgets.then((value) => onWidgets(value));
+) async {
+  final List<Widget> allRepresentationWidgets = [];
+
+  for (final readerInfo in readers) {
+    // For each ReaderInfo, build its specific representation widgets.
+    final representations =
+        await _buildRepresentationsForSingleReader(context, readerInfo);
+    allRepresentationWidgets.addAll(representations);
+  }
+  return allRepresentationWidgets;
 }
 
+/// Builds a list of `_RepresentationWidget`s for a single [ReaderInfo] object.
+///
+/// It queries the `DataReader` within `readerInfo` for supported standard formats
+/// (plus a custom format) and attempts to create a `_RepresentationWidget` for each.
+/// Duplicate widgets (e.g., if multiple raw formats resolve to the same `DataFormat`)
+/// are filtered out.
+///
+/// - [context]: The `BuildContext`.
+/// - [readerInfo]: The [ReaderInfo] object to process.
+///
+/// Returns a `Future` that completes with a list of `_RepresentationWidget`s.
+Future<List<Widget>> _buildRepresentationsForSingleReader(
+  BuildContext context,
+  ReaderInfo readerInfo,
+) async {
+  // Get the list of supported data formats for the current reader.
+  final itemFormats = readerInfo.reader.getFormats([
+    ...Formats.standardFormats, // Includes common types like text, HTML, images, URIs.
+    formatCustom, // The example custom format.
+  ]);
+
+  // Asynchronously generate a widget for each format.
+  final futures =
+      itemFormats.map((e) => _widgetForFormat(context, e, readerInfo.reader));
+
+  // Wait for all format widgets to be built.
+  final widgets = await Future.wait(futures);
+
+  // Filter out any null results (formats that couldn't be rendered)
+  // and ensure they are of type _RepresentationWidget.
+  final children = widgets
+      .where((element) => element != null)
+      .cast<_RepresentationWidget>()
+      .toList(growable: true);
+
+  // Remove duplicate widgets if different raw types map to the same DataFormat.
+  final Set<DataFormat> uniqueFormats = <DataFormat>{};
+  children.retainWhere((element) => uniqueFormats.add(element.format));
+  return children;
+}
+
+/// A helper class to hold information about a `DataReader` and its associated metadata.
+/// This includes the raw `DataReader`, its suggested name, and details about its platform formats.
 class ReaderInfo {
+  final DataReader reader;
+  final String? suggestedName;
+  final List<_PlatformFormat> _formats; // Internal list of platform format details.
+  final Object? localData; // Optional local data associated with the reader.
+
   ReaderInfo._({
     required this.reader,
     required this.suggestedName,
@@ -35,24 +96,24 @@ class ReaderInfo {
     this.localData,
   }) : _formats = formats;
 
+  /// Asynchronously creates a [ReaderInfo] instance from a [DataReader].
+  ///
+  /// It fetches platform format details, including whether they are virtual or synthesized.
   static Future<ReaderInfo> fromReader(
     DataReader reader, {
     Object? localData,
   }) async {
-    // build list of native formats with virtual/synthesized flags
-    final List<String> formats = reader.platformFormats;
+    final List<String> platformFmts = reader.platformFormats;
+    final List<String> rawFormats = await reader.rawReader!.getAvailableFormats();
 
-    final List<String> rawFormats =
-        await reader.rawReader!.getAvailableFormats();
-
-    // Reader may synthesize format from URI.
-    List<String> synthesizedByReader = List.of(formats)
+    // Identify formats synthesized by the reader itself (not directly present as raw formats).
+    List<String> synthesizedByReader = List.of(platformFmts)
       ..removeWhere((element) => rawFormats.contains(element));
 
-    final virtual =
-        await Future.wait(formats.map((e) => reader.rawReader!.isVirtual(e)));
-
-    final synthesized = await Future.wait(formats.map((e) async =>
+    // Check virtual and synthesized status for each platform format.
+    final virtualFlags = await Future.wait(
+        platformFmts.map((e) => reader.rawReader!.isVirtual(e)));
+    final synthesizedFlags = await Future.wait(platformFmts.map((e) async =>
         await reader.rawReader!.isSynthesized(e) ||
         synthesizedByReader.contains(e)));
 
@@ -60,22 +121,19 @@ class ReaderInfo {
       reader: reader,
       suggestedName: await reader.getSuggestedName(),
       localData: localData,
-      formats: formats
+      formats: platformFmts
           .mapIndexed((index, element) => _PlatformFormat(
-                element,
-                virtual: virtual[index],
-                synthesized: synthesized[index],
+                element, // The platform format string (e.g., MIME type).
+                virtual: virtualFlags[index],
+                synthesized: synthesizedFlags[index],
               ))
           .toList(growable: false),
     );
   }
-
-  final DataReader reader;
-  final String? suggestedName;
-  final List<_PlatformFormat> _formats;
-  final Object? localData;
 }
 
+/// Internal helper class to store a platform format string along with its
+/// `virtual` and `synthesized` status.
 class _PlatformFormat {
   final PlatformFormat format;
   final bool virtual;
@@ -122,176 +180,44 @@ extension _ReadValue on DataReader {
   }
 }
 
-/// Builds widget containing information for data reader.
-Future<Widget> _buildWidgetForReader(
-  BuildContext context,
-  ReaderInfo reader,
-  int index,
-) async {
-  final itemFormats = reader.reader.getFormats([
-    ...Formats.standardFormats,
-    formatCustom,
-  ]);
+// _buildWidgetForReader, _ReaderWidget, _HeaderWidget, and _FooterWidget are no longer needed
+// as their functionality is either incorporated into _buildRepresentationsForSingleReader
+// or handled by ClipboardHistoryItemWidget.
 
-  // Request all data before awaiting
-  final futures =
-      itemFormats.map((e) => _widgetForFormat(context, e, reader.reader));
-
-  // Now await all futures
-  final widgets = await Future.wait(futures);
-  final children = widgets
-      .where((element) => element != null)
-      .cast<_RepresentationWidget>()
-      .toList(growable: true);
-
-  // remove duplicate widgets
-  final formats = <DataFormat>{};
-  children.retainWhere((element) => formats.add(element.format));
-
-  // build list of native formats with virtual/synthesized flags
-  final nativeFormats = reader._formats.map((e) {
-    final attributes = [
-      if (e.virtual) 'virtual',
-      if (e.synthesized) 'synthesized',
-    ].join(', ');
-    return attributes.isNotEmpty ? '${e.format} ($attributes)' : e.format;
-  }).toList(growable: false);
-
-  return _ReaderWidget(
-    itemName: 'Data item $index',
-    suggestedFileName: reader.suggestedName ?? 'null',
-    representations: children,
-    nativeFormats: nativeFormats,
-  );
-}
-
-class _ReaderWidget extends StatelessWidget {
-  const _ReaderWidget({
-    required this.itemName,
-    required this.suggestedFileName,
-    required this.representations,
-    required this.nativeFormats,
-  });
-
-  final String itemName;
-  final String suggestedFileName;
-  final List<Widget> representations;
-  final List<String>? nativeFormats;
-
-  @override
-  Widget build(BuildContext context) {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(10),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          _HeaderWidget(
-              itemName: itemName, suggestedFileName: suggestedFileName),
-          ...representations.intersperse(const SizedBox(height: 2)),
-          if (nativeFormats != null) ...[
-            const SizedBox(height: 2),
-            _FooterWidget(nativeFormats: nativeFormats!),
-          ]
-        ],
-      ),
-    );
-  }
-}
-
-class _HeaderWidget extends StatelessWidget {
-  const _HeaderWidget({
-    required this.itemName,
-    required this.suggestedFileName,
-  });
-
-  final String itemName;
-  final String suggestedFileName;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      color: Colors.blueGrey.shade100,
-      padding: const EdgeInsets.all(10),
-      child: Row(
-        children: [
-          Text(
-            itemName,
-            style: const TextStyle(fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(width: 14),
-          Flexible(
-            child: Text('(Suggested file name: $suggestedFileName)',
-                style: TextStyle(
-                  fontSize: 11,
-                  color: Colors.grey.shade600,
-                )),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _FooterWidget extends StatelessWidget {
-  const _FooterWidget({
-    required this.nativeFormats,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final formats = nativeFormats.join(', ');
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-      color: Colors.blueGrey.shade50,
-      child: Text.rich(
-        TextSpan(
-          children: [
-            const TextSpan(
-              text: 'Native formats: ',
-              style: TextStyle(fontWeight: FontWeight.bold),
-            ),
-            TextSpan(text: formats),
-          ],
-        ),
-        style: TextStyle(fontSize: 11.0, color: Colors.grey.shade600),
-      ),
-    );
-  }
-
-  final List<String> nativeFormats;
-}
-
+/// A widget to display a [NamedUri] (a URI with an optional name).
 class _UriWidget extends StatelessWidget {
-  const _UriWidget({
-    required this.uri,
-  });
+  const _UriWidget({required this.uri});
 
   final NamedUri uri;
 
   @override
   Widget build(BuildContext context) {
     return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
+      crossAxisAlignment: CrossAxisAlignment.start, // Align text to the start
       children: [
-        Text(uri.uri.toString()),
-        if (uri.name != null)
-          DefaultTextStyle.merge(
-            style: TextStyle(color: Colors.grey.shade600),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text('Name: '),
-                Expanded(
-                  child: Text(uri.name!),
-                ),
-              ],
-            ),
-          )
+        SelectableText(uri.uri.toString()), // Make URI selectable
+        if (uri.name != null && uri.name!.isNotEmpty) ...[
+          const SizedBox(height: 2),
+          Text.rich(
+            TextSpan(children: [
+              const TextSpan(
+                  text: 'Name: ',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+              TextSpan(text: uri.name!),
+            ]),
+            style: TextStyle(color: Colors.grey.shade700, fontSize: 12),
+          ),
+        ]
       ],
     );
   }
 }
 
+/// A widget that displays a single data representation from the clipboard.
+///
+/// It shows the name of the data format (e.g., "Plain Text", "Image (PNG)")
+/// and any relevant tags (virtual, synthesized). The actual content is provided
+/// via the [content] widget.
 class _RepresentationWidget extends StatelessWidget {
   const _RepresentationWidget({
     required this.format,
@@ -301,181 +227,233 @@ class _RepresentationWidget extends StatelessWidget {
     required this.content,
   });
 
+  final DataFormat format; // The DataFormat this widget represents.
+  final String name; // Display name for the format.
+  final bool synthesized; // True if the data is synthesized by the system.
+  final bool virtual; // True if the data is virtual (loaded on demand).
+  final Widget content; // The actual widget displaying the content for this format.
+
   @override
   Widget build(BuildContext context) {
-    final tag = [
-      if (virtual) 'virtual',
-      if (synthesized) 'synthesized',
-    ].join(' ');
+    // Create a tag string for virtual/synthesized status.
+    final List<String> tags = [];
+    if (virtual) tags.add('virtual');
+    if (synthesized) tags.add('synthesized');
+    final String tagString = tags.isNotEmpty ? ' (${tags.join(', ')})' : '';
+
     return DefaultTextStyle.merge(
-      style: const TextStyle(fontSize: 12),
-      child: Container(
-        decoration: BoxDecoration(
-          color: Colors.blueGrey.shade50,
-        ),
-        padding: const EdgeInsets.symmetric(horizontal: 12.0, vertical: 6.0),
+      style: const TextStyle(
+          fontSize: 13,
+          color: Colors.black87), // Base style for the content.
+      child: Padding(
+        padding: const EdgeInsets.symmetric(
+            horizontal: 4.0, vertical: 8.0), // Padding around the content.
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
+          crossAxisAlignment:
+              CrossAxisAlignment.start, // Align content to the start.
           children: [
-            Row(
-              children: [
-                Text(
-                  name,
-                  style: const TextStyle(fontWeight: FontWeight.bold),
-                ),
-                Text(tag.isNotEmpty ? ' ($tag)' : ''),
-              ],
+            // Display the format name and tags.
+            Text.rich(
+              TextSpan(children: [
+                TextSpan(
+                    text: name,
+                    style: const TextStyle(fontWeight: FontWeight.bold)),
+                if (tagString.isNotEmpty)
+                  TextSpan(
+                      text: tagString,
+                      style: TextStyle(
+                          fontSize: 11, color: Colors.grey.shade600)),
+              ]),
             ),
-            const SizedBox(
-              height: 2,
-            ),
-            content,
+            const SizedBox(height: 4), // Spacing before the actual content.
+            content, // The widget that renders the data itself.
           ],
         ),
       ),
     );
   }
-
-  final DataFormat format;
-  final String name;
-  final bool synthesized;
-  final bool virtual;
-  final Widget content;
 }
 
+/// Asynchronously creates a [_RepresentationWidget] for image data.
+///
+/// - [context]: The `BuildContext`.
+/// - [format]: The specific [FileFormat] of the image (e.g., `Formats.png`).
+/// - [name]: The display name for this image format (e.g., "PNG").
+/// - [reader]: The [DataReader] to read the image data from.
+///
+/// Returns a `Future` that completes with the `_RepresentationWidget` or `null` if
+/// the image data cannot be read or is empty.
 Future<_RepresentationWidget?> _widgetForImage(
   BuildContext context,
   FileFormat format,
-  String name,
+  String name, // e.g., "PNG", "JPEG"
   DataReader reader,
 ) async {
-  final scale = MediaQuery.of(context).devicePixelRatio;
-  final image = await reader.readFile(format);
-  if (image == null || image.isEmpty /* Tiff on Firefox/Linux */) {
-    return null;
-  } else {
+  final scale =
+      MediaQuery.of(context).devicePixelRatio; // For proper image scaling.
+  try {
+    final imageBytes = await reader.readFile(format);
+    if (imageBytes == null || imageBytes.isEmpty) {
+      // This can happen, e.g., for TIFF on Firefox/Linux as per original comment.
+      return null;
+    }
     return _RepresentationWidget(
       format: format,
-      name: 'Image ($name)',
+      name: 'Image ($name)', // e.g., "Image (PNG)"
       synthesized: reader.isSynthesized(format),
       virtual: reader.isVirtual(format),
       content: Container(
         padding: const EdgeInsets.only(top: 4),
-        alignment: Alignment.centerLeft,
+        alignment: Alignment.centerLeft, // Align image to the left.
+        constraints: BoxConstraints(
+          maxHeight: 300, // Max height for image preview.
+          maxWidth: MediaQuery.of(context).size.width * 0.7, // Max width.
+        ),
         child: Image.memory(
-          image,
-          scale: scale,
+          imageBytes,
+          scale: scale, // Apply device pixel ratio.
+          fit: BoxFit.contain, // Ensure image fits within constraints.
+          errorBuilder: (context, error, stackTrace) =>
+              const Text('Could not load image preview.'), // Error display.
         ),
       ),
+    );
+  } catch (e) {
+    print("Error reading image format $name: $e");
+    return _RepresentationWidget(
+        format: format,
+        name: 'Image ($name) - Error',
+        synthesized: false, virtual: false,
+        content: Text('Error loading image: $e', style: TextStyle(color: Colors.red))
     );
   }
 }
 
+/// Asynchronously creates a specific [_RepresentationWidget] based on the [DataFormat].
+///
+/// This function acts as a dispatcher, calling more specialized handlers like
+/// [_widgetForImage] or creating `Text` widgets directly for text-based formats.
+///
+/// - [context]: The `BuildContext`.
+/// - [format]: The [DataFormat] to render.
+/// - [reader]: The [DataReader] to read data from.
+///
+/// Returns a `Future` that completes with the `_RepresentationWidget` or `null`
+/// if the format is not supported or data cannot be read.
 Future<_RepresentationWidget?> _widgetForFormat(
     BuildContext context, DataFormat format, DataReader reader) async {
-  switch (format) {
-    case Formats.plainText:
-      final text = await reader.readValue(Formats.plainText);
-      if (text == null) {
-        return null;
-      } else {
-        // Sometimes macOS uses CR for line break;
-        final sanitized = text.replaceAll(RegExp('\r[\n]?'), '\n');
-        return _RepresentationWidget(
-          format: format,
-          name: 'Plain Text',
-          synthesized: reader.isSynthesized(format),
-          virtual: reader.isVirtual(format),
-          content: Text(sanitized),
-        );
-      }
-    case Formats.plainTextFile:
-      if (!reader.isVirtual(format) && !reader.isSynthesized(format)) {
-        return null;
-      }
-      final contents = await reader.readFile(Formats.plainTextFile);
-      if (contents == null) {
-        return null;
-      } else {
-        final text = utf8.decode(contents, allowMalformed: true);
-        return _RepresentationWidget(
-          format: format,
-          name: 'Plain Text (utf8 file)',
-          synthesized: reader.isSynthesized(format),
-          virtual: reader.isVirtual(format),
-          content: Text(text),
-        );
-      }
-    case Formats.htmlText:
-      final html = await reader.readValue(Formats.htmlText);
-      if (html == null) {
-        return null;
-      } else {
-        return _RepresentationWidget(
-          format: format,
-          name: 'HTML Text',
-          synthesized: reader.isSynthesized(format),
-          virtual: reader.isVirtual(format),
-          content: Text(html),
-        );
-      }
-    case Formats.png:
-      return _widgetForImage(context, Formats.png, 'PNG', reader);
-    case Formats.jpeg:
-      return _widgetForImage(context, Formats.jpeg, 'JPEG', reader);
-    case Formats.gif:
-      return _widgetForImage(context, Formats.gif, 'GIF', reader);
-    case Formats.tiff:
-      return _widgetForImage(context, Formats.tiff, 'TIFF', reader);
-    case Formats.webp:
-      return _widgetForImage(context, Formats.webp, 'WebP', reader);
-    // regular and file uri may have same mime types on some platforms
-    case Formats.uri:
-    case Formats.fileUri:
-      // Make sure to request both values before awaiting
-      final fileUriFuture = reader.readValue(Formats.fileUri);
-      final uriFuture = reader.readValue(Formats.uri);
+  try {
+    switch (format) {
+      case Formats.plainText:
+        final text = await reader.readValue(Formats.plainText);
+        return text == null
+            ? null
+            : _RepresentationWidget(
+                format: format,
+                name: 'Plain Text',
+                synthesized: reader.isSynthesized(format),
+                virtual: reader.isVirtual(format),
+                // Sanitize line breaks (macOS sometimes uses CR).
+                content: SelectableText(
+                    text.replaceAll(RegExp('\r[\n]?'), '\n')),
+              );
 
-      // try file first and if it fails try regular URI
-      final fileUri = await fileUriFuture;
-      if (fileUri != null) {
-        return _RepresentationWidget(
-          format: Formats.fileUri,
-          name: 'File URI',
-          synthesized: reader.isSynthesized(format),
-          virtual: reader.isVirtual(format),
-          content: Text(fileUri.toString()),
-        );
-      }
-      final uri = await uriFuture;
-      if (uri != null) {
-        return _RepresentationWidget(
-          format: Formats.uri,
-          name: 'URI',
-          synthesized: reader.isSynthesized(Formats.uri),
-          virtual: reader.isVirtual(Formats.uri),
-          content: _UriWidget(uri: uri),
-        );
-      }
-      return null;
-    case formatCustom:
-      final data = await reader.readValue(formatCustom);
-      if (data == null) {
+      case Formats.plainTextFile:
+        // This format is typically for virtual/synthesized text files.
+        if (!reader.isVirtual(format) && !reader.isSynthesized(format)) {
+          return null;
+        }
+        final contents = await reader.readFile(Formats.plainTextFile);
+        return contents == null
+            ? null
+            : _RepresentationWidget(
+                format: format,
+                name: 'Plain Text (UTF-8 File)',
+                synthesized: reader.isSynthesized(format),
+                virtual: reader.isVirtual(format),
+                content: SelectableText(
+                    utf8.decode(contents, allowMalformed: true)),
+              );
+
+      case Formats.htmlText:
+        final html = await reader.readValue(Formats.htmlText);
+        // TODO: Consider using flutter_html package for richer HTML rendering.
+        // For now, displaying raw HTML string.
+        return html == null
+            ? null
+            : _RepresentationWidget(
+                format: format,
+                name: 'HTML',
+                synthesized: reader.isSynthesized(format),
+                virtual: reader.isVirtual(format),
+                content: SelectableText(html),
+              );
+
+      // Image formats delegating to _widgetForImage:
+      case Formats.png:
+        return _widgetForImage(context, Formats.png, 'PNG', reader);
+      case Formats.jpeg:
+        return _widgetForImage(context, Formats.jpeg, 'JPEG', reader);
+      case Formats.gif:
+        return _widgetForImage(context, Formats.gif, 'GIF', reader);
+      case Formats.tiff:
+        return _widgetForImage(context, Formats.tiff, 'TIFF', reader);
+      case Formats.webp:
+        return _widgetForImage(context, Formats.webp, 'WebP', reader);
+
+      // URI formats (regular and file URIs):
+      case Formats.uri:
+      case Formats.fileUri:
+        // Attempt to read both file URI and regular URI, prioritizing file URI.
+        final fileUri = await reader.readValue(Formats.fileUri);
+        if (fileUri != null) {
+          return _RepresentationWidget(
+            format: Formats.fileUri, // Explicitly use Formats.fileUri here
+            name: 'File URI',
+            synthesized: reader.isSynthesized(Formats.fileUri),
+            virtual: reader.isVirtual(Formats.fileUri),
+            content: _UriWidget(uri: fileUri), // Use the dedicated _UriWidget
+          );
+        }
+        final uri = await reader.readValue(Formats.uri);
+        return uri == null
+            ? null
+            : _RepresentationWidget(
+                format: Formats.uri, // Explicitly use Formats.uri
+                name: 'URI',
+                synthesized: reader.isSynthesized(Formats.uri),
+                virtual: reader.isVirtual(Formats.uri),
+                content: _UriWidget(uri: uri), // Use the dedicated _UriWidget
+              );
+
+      case formatCustom: // Example custom format
+        final data = await reader.readValue(formatCustom);
+        return data == null
+            ? null
+            : _RepresentationWidget(
+                format: format,
+                name: 'Custom Data',
+                synthesized: reader.isSynthesized(formatCustom),
+                virtual: reader.isVirtual(formatCustom),
+                content: Text(data.toString()), // Simple string representation
+              );
+      default:
+        // This format is not explicitly handled for display.
         return null;
-      } else {
-        return _RepresentationWidget(
-          format: format,
-          name: 'Custom Data',
-          synthesized: reader.isSynthesized(formatCustom),
-          virtual: reader.isVirtual(formatCustom),
-          content: Text(data.toString()),
-        );
-      }
-    default:
-      return null;
+    }
+  } catch (e) {
+    print("Error processing format $format: $e");
+    return _RepresentationWidget(
+        format: format, // Return a representation for the format that errored
+        name: 'Error: ${format.platformType}',
+        synthesized: false, virtual: false,
+        content: Text('Could not load data for this format: $e', style: TextStyle(color: Colors.red))
+    );
   }
 }
 
+/// Utility extension for interspersing elements in an iterable.
+/// Example: `[1, 2, 3].intersperse(0)` yields `[1, 0, 2, 0, 3]`.
 extension IntersperseExtensions<T> on Iterable<T> {
   Iterable<T> intersperse(T element) sync* {
     final iterator = this.iterator;
